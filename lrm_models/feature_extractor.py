@@ -35,14 +35,19 @@ class FeatureExtractor(nn.Module):
         # Initialize a dictionary to store outputs for each layer.
         self._features = {layer: torch.empty(0) for layer in layers}        
         self.hooks = {} # Dictionary to store the hooks for later removal.
-        
+    
+    def drop_features(self):
+        for layer_id in self.layers:
+            self._features[layer_id] = []
+            
     def hook_layers(self):        
         self.remove_hooks() # clean up existing hooks
         for layer_id in self.layers:
             layer = dict([*self.model.named_modules()])[layer_id]
             # Register a forward hook that saves the outputs of this layer.
             self.hooks[layer_id] = layer.register_forward_hook(self.save_outputs_hook(layer_id))
-    
+            self._features[layer_id] = []
+            
     def remove_hooks(self):
         # Remove all registered hooks.
         for layer_id in self.layers:
@@ -53,7 +58,7 @@ class FeatureExtractor(nn.Module):
                 # Remove the hook associated with this layer.
                 self.hooks[layer_id].remove()
                 del self.hooks[layer_id]
-    
+                
     def __enter__(self, *args): 
         # When entering the context (using `with`), set up hooks.
         self.hook_layers()
@@ -81,7 +86,7 @@ class FeatureExtractor(nn.Module):
             if self.clone: output = clone(output)
             if self.device: output = to_device(output, self.device)
             # Store the final processed output.
-            self._features[layer_id] = output
+            self._features[layer_id].append(output)
         return fn
 
     def forward(self, x):

@@ -68,3 +68,9 @@ def datasets(dataset, split, *args, **kwargs):
 
 def compute_prototypes():
     return _lrm_utils.compute_prototypes
+
+def load_vision_prototypes():    
+    return _lrm_utils.load_vision_prototypes
+
+def load_clip_prototypes():
+    return _lrm_utils.load_clip_prototypes

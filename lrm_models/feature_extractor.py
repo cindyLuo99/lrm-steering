@@ -116,5 +116,7 @@ def get_layer_shapes(model, layer_names, x):
     with torch.no_grad():        
         with FeatureExtractor(model, layer_names) as extractor:
             features = extractor(x)
+            print(type(features))
+            print(features)
             shapes = {k:v.shape for k,v in features.items()}
     return shapes

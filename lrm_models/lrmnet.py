@@ -24,7 +24,7 @@ class LRMNet(nn.Module):
         mod_layers = OrderedDict([])
         for dest_layer, source_layers in connections.items():
             # here, it registers hooks on specific layers of the network (both the source and destination layers) 
-            # to capture activations during forward passes.
+            # to capture activations during forward passes & alter activations in second pass using the stored activations.
             mod_layer = LongRangeModulation(network, dest_layer, source_layers, img_size=img_size)
             mod_layers[mod_layer.name] = mod_layer
         

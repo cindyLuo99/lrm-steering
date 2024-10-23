@@ -11,18 +11,24 @@ class LRMNet(nn.Module):
     def __init__(self, network, mod_connections, forward_passes=2, img_size=224, 
                  return_list=True):
         super().__init__()
+        # mod_connections defines which layers will receive feedback from other layers
         self.forward_passes = forward_passes
-        self.feedforward = network
+        self.feedforward = network # Core feed-forward network
         self.prevent_inplace_after_connections(mod_connections)
         self.return_list = return_list
         
         # Create Modulatory Connections
         connections = self.group_by_destination(mod_connections)
+        # These connections are grouped by destination using group_by_destination(), 
+        # and for each destination layer, a LongRangeModulation block is created, which manages the feedback process.
         mod_layers = OrderedDict([])
         for dest_layer, source_layers in connections.items():
+            # here, it registers hooks on specific layers of the network (both the source and destination layers) 
+            # to capture activations during forward passes.
             mod_layer = LongRangeModulation(network, dest_layer, source_layers, img_size=img_size)
             mod_layers[mod_layer.name] = mod_layer
-            
+        
+        # These blocks are stored in self.lrm, which is a sequential container of all feedback connections.
         self.lrm = nn.Sequential(mod_layers)
         
         # Clear mod_inputs created when initilizing modules
@@ -36,6 +42,8 @@ class LRMNet(nn.Module):
 
         return connections        
     
+    # To ensure proper handling of feedback, any in-place operations in the network’s layers 
+    # that could interfere with feedback are disabled.
     def prevent_inplace_after_connections(self, mod_connections):
         # Extract all layers from source and destination
         layers_to_check = set()
@@ -72,6 +80,7 @@ class LRMNet(nn.Module):
             
             It's also possible to return the outputs of each forward pass (list_outputs=True).                                                     
         '''
+        # If drop_state is True, any stored feedback activations are cleared before each pass, ensuring fresh feedback is applied.
         return_list = self.return_list if return_list is None else return_list
         
         # Optionally drop any stored feedback or skip inputs (from previous batch)
@@ -86,6 +95,7 @@ class LRMNet(nn.Module):
         outputs = []
         forward_passes = self.forward_passes if forward_passes is None else forward_passes
         for pass_num in range(0, forward_passes):
+            # The model doesn’t directly distinguish activations by pass number.
             out = self.feedforward(x)
             outputs.append(out)
 
@@ -93,7 +103,18 @@ class LRMNet(nn.Module):
             return outputs
         
         return out
-    
+
+# a bit more info:
+'''
+First Pass:
+•	The model performs a regular forward pass.
+•	Activations from the source layers are captured using hooks and stored in mod_inputs.
+•	No feedback is applied in the first pass.
+Subsequent Passes:
+•	The stored activations in mod_inputs are used to modulate the activations in the target layers.
+•	After each pass, the feedback activations are updated to reflect the new activations from the deeper layers.
+'''
+
 class SteerableLRM(nn.Module):
     def __init__(self, network, mod_connections, forward_passes=2, return_list=True, 
                  img_size=224):
@@ -122,12 +143,17 @@ class SteerableLRM(nn.Module):
 
         return connections        
     
+
     def add_steering_signals(self, steering_signals):
         for steering_signal in steering_signals:
             self.add_steering_signal(**steering_signal)
-            
+
+    # This method applies the external steering signal by injecting it into the feedback mechanism, 
+    # replacing or blending it with the native feedback activations.  
+    # Strengths are the positive/negative scalers learned
+    # Alpha is a weighted factor: controls how much of the steering signal is blended with the original feedback from the network.   
     def add_steering_signal(self, source, activation, strength, alpha=1):
-        neg_scale_adjust, pos_scale_adjust = _pair(strength)
+        neg_scale_adjust, pos_scale_adjust = _pair(strength) # Split strength into neg/pos scale adjustments
         
         # find modules targeted by this steering_source, replace their
         # modulatory inputs for this source with steering activation
@@ -143,11 +169,14 @@ class SteerableLRM(nn.Module):
                         # update current modulatory input (if alpha==1, we end up just replacing it with steering activation)
                         curr_input = lrm_module.mod_inputs[feedback_module_name]
                         lrm_module.mod_inputs[feedback_module_name] = alpha * activation + (1-alpha) * curr_input
+
                     else:
                         # without curr_input, simply set to template
                         lrm_module.mod_inputs[feedback_module_name] = activation
         
     @torch.no_grad()
+    # This method adjusts the strength of the steering signal, 
+    # controlling how much it amplifies or dampens the feedback.
     def adjust_modulation_strengths(self, feedback_module, neg_scale_adjust, pos_scale_adjust):
         if neg_scale_adjust != 1.0 and not hasattr(feedback_module, 'neg_scale_orig'):
             feedback_module.neg_scale_orig = feedback_module.neg_scale
@@ -158,6 +187,7 @@ class SteerableLRM(nn.Module):
             feedback_module.pos_scale = nn.Parameter(feedback_module.pos_scale_orig * neg_scale_adjust)
 
     @torch.no_grad()
+    # After applying steering, this method resets the modulation strengths to their default values.
     def reset_modulation_strengths(self):
         for _,lrm_module in self.lrm.named_children():            
             for _,feedback_module in lrm_module.named_children():

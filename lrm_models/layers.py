@@ -18,16 +18,23 @@ from .feature_extractor import get_layer_shapes
 #  Upsampling
 # ===================================================================
 
+# upsampling is crucial in aligning features from different layers that might have
+# different spatial dimensions
+# take deeper and smaller feature maps and resize them so they can be combined with earlier feature maps
+
 def init_linear(m, act_func=None, init='auto', bias_std=0.01):
-    if getattr(m,'bias',None) is not None and bias_std is not None: normal_(m.bias, 0, bias_std)
-    if init=='auto':
+    # Initialize weights of linear layers based on the activation function used
+    if getattr(m,'bias',None) is not None and bias_std is not None: normal_(m.bias, 0, bias_std) # Adds some Gaussian noise to the 0 biases
+    if init=='auto': # Automatically selects weight initialization based on the activation function
         if act_func in (F.relu_,F.leaky_relu_): init = kaiming_uniform_
         else: init = getattr(act_func.__class__, '__default_init__', None)
         if init is None: init = getattr(act_func, '__default_init__', None)
     if init is not None: init(m.weight)
 
 def icnr_init(x, scale=2, init=nn.init.kaiming_normal_):
+    # Initializes weights using ICNR (Initial Channel Normalization) for PixelShuffle layers.
     "ICNR init of `x`, with `scale` and `init` function"
+    # batch size, # of kernels/feature maps, height, width
     ni,nf,h,w = x.shape
     ni2 = int(ni/(scale**2))
     k = init(x.new_zeros([ni2,nf,h,w])).transpose(0, 1)
@@ -127,6 +134,7 @@ class UpsampleBlock(nn.Sequential):
 #  Softmax
 # ===================================================================
 
+# This Softmax class allows you to compute a softmax over different dimensions of the input (e.g., across channels, spatial dimensions, or both).
 class Softmax(nn.Module):
     '''
         softmax over channels ('C'), space ('HxW'), or both ('CxHxW')
@@ -162,6 +170,8 @@ class FeedbackScale(nn.Module):
         self.mode = mode
         
     def forward(self, x: Tensor, *args) -> Tensor:
+        #  The tanh activation squashes the values between -1 and 1. 
+        #  This bounds the feedback signal, preventing very large activations from being passed between layers.
         if self.mode == 'tanh':
             x = torch.tanh(x)
         return x
@@ -170,6 +180,7 @@ class FeedbackScale(nn.Module):
         return f"{self.__class__.__name__}(mode='{self.mode}')"
 
 class MemoryFormatModule(nn.Module):
+    #  It ensures that tensors are in the correct memory format during the forward pass.
     def __init__(self):
         super().__init__()
         self.memory_format = torch.contiguous_format
@@ -211,11 +222,12 @@ class AddSpatialDimension(MemoryFormatModule):
         return f"{self.__class__.__name__}()"
     
 class ChannelNorm(nn.LayerNorm):
+    # normalizes activations across the feature maps
     def forward(self, x: Tensor, *args) -> Tensor:        
         if len(x.shape) == 4: 
-            x = x.permute(0, 2, 3, 1)
+            x = x.permute(0, 2, 3, 1) # Move channels to last dimension for LayerNorm
             x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-            x = x.permute(0, 3, 1, 2)
+            x = x.permute(0, 3, 1, 2) # Move channels back to original position
         elif len(x.shape) == 2:
             x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         else:
@@ -230,8 +242,11 @@ class AdaptiveFullstackNorm(nn.LayerNorm):
         x = F.layer_norm(x, x.shape[-3:], weight, bias, self.eps)
         x = x.to(memory_format = memory_format)
         return x 
-    
+
+# These classes manage the order of normalization, scaling (squashing), and resizing. 
+# The difference between them is the order in which these operations are applied:
 class NormSquashResize(nn.Module):
+    # First normalizes, then squashes the values, and finally resizes.
     norm_types = ['ChannelNorm', 'AdaptiveFullstackNorm']
     def __init__(self, in_channels, in_shape, out_shape, norm_type='ChannelNorm', scale_type='tanh', resize_type='UpsampleBilinear'):
         assert norm_type in self.norm_types, f"`norm_type` must be in {self.norm_types}, got {norm_type}"
@@ -261,6 +276,7 @@ class NormSquashResize(nn.Module):
         return x
     
 class ResizeNormSquash(nn.Module):
+    #  First resizes, then normalizes, and finally squashes.
     norm_types = ['ChannelNorm', 'AdaptiveFullstackNorm']
     def __init__(self, in_channels, in_shape, out_shape, norm_type='ChannelNorm', scale_type='tanh', resize_type='UpsampleBilinear'):
         assert norm_type in self.norm_types, f"`norm_type` must be in {self.norm_types}, got {norm_type}"
@@ -307,6 +323,7 @@ class ModBlock(MemoryFormatModule):
             self.rescale = ResizeNormSquash(in_channels, in_shape, out_shape, scale_type='tanh', 
                                             norm_type=norm_type, resize_type=resize_type)
         
+        # they are the same for all channels in the upsampled feature maps, global learnable parameters for each modulation added
         self.neg_scale = torch.nn.Parameter(torch.FloatTensor([1.0]))
         self.pos_scale = torch.nn.Parameter(torch.FloatTensor([1.0]))
         
@@ -343,6 +360,13 @@ class ModBlock(MemoryFormatModule):
         
         return x
 
+# the modulation process
+# 1. upsamping: change the size of the feature map from n*n (in the source layer) to m*m (in the target layer)
+# 2. scaling: scale neg and pos separately to allow assymetric inhibition/facilitation on all feature map
+# 3. channel alignment: 1*1 convolution is applied to transform k channels (in the source layer) to l channels (in the target layer)
+
+# The hooks in LongRangeModulation capture activations only for the current batch and clear them after each forward pass, 
+# preventing cross-category or cross-batch activation carryover.
 class LongRangeModulation(nn.Sequential):
     def __init__(self, model, mod_target, mod_sources, img_size=224, 
                  mod_block_order='norm-squash-resize',
@@ -379,6 +403,7 @@ class LongRangeModulation(nn.Sequential):
             
             name=f'from_{source_layer_name.replace(".","_")}_to_{mod_target.replace(".","_")}'
             
+            # register hooks to hook layer output 
             self.mod_hooks += [source_module.register_forward_hook(partial(self.hook_fn, name=name))]
             
             source_size = _pair(shapes[source_layer_name][2:]) or (1,1)
@@ -416,6 +441,7 @@ class LongRangeModulation(nn.Sequential):
 
         super().__init__(layers)
     
+    # use hooks to change activations, just like the perturbation i did!
     def forward_hook_target(self, module, input, output):
         '''modulate target output'''        
         
@@ -432,6 +458,7 @@ class LongRangeModulation(nn.Sequential):
         total_mod = torch.zeros_like(output)
         for module in self:
             if hasattr(module, 'name',) and module.name in self.mod_inputs:
+                # use the store activation from past round to modulate the activation from this round
                 source_activation = self.mod_inputs[module.name]
 
                 mod = module(source_activation, target_size=target_size)
@@ -453,7 +480,10 @@ class LongRangeModulation(nn.Sequential):
         return output
     
     def hook_fn(self, module, input, output, name):
+        # The activations captured by the hooks are stored in a dictionary called mod_inputs
         self.mod_inputs[name] = output
+        # For each new batch, the hooks overwrite the existing activations in self.mod_inputs with new activations, 
+        # which effectively clears or resets the previous activations.
        
     def forward(self, x):
         '''forward pass of lrm modules doesn't get called'''

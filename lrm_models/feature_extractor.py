@@ -28,32 +28,39 @@ class FeatureExtractor(nn.Module):
         layers = [layers] if isinstance(layers, str) else layers
         self.model = model
         self.layers = layers
-        self.detach = detach
-        self.clone = clone
+        self.detach = detach # If True, detaches tensors from the computation graph to save memory
+        self.clone = clone # If True, makes a clone of the feature map to avoid side effects
         self.device = device
-        self.retain = retain
+        self.retain = retain # If False, empties stored features after each pass.
+        # Initialize a dictionary to store outputs for each layer.
         self._features = {layer: torch.empty(0) for layer in layers}        
-        self.hooks = {}
+        self.hooks = {} # Dictionary to store the hooks for later removal.
         
     def hook_layers(self):        
-        self.remove_hooks()
+        self.remove_hooks() # clean up existing hooks
         for layer_id in self.layers:
             layer = dict([*self.model.named_modules()])[layer_id]
+            # Register a forward hook that saves the outputs of this layer.
             self.hooks[layer_id] = layer.register_forward_hook(self.save_outputs_hook(layer_id))
     
     def remove_hooks(self):
+        # Remove all registered hooks.
         for layer_id in self.layers:
             if self.retain == False:
+                # If retain is False, reset the feature storage for this layer.
                 self._features[layer_id] = torch.empty(0)
             if layer_id in self.hooks:
+                # Remove the hook associated with this layer.
                 self.hooks[layer_id].remove()
                 del self.hooks[layer_id]
     
     def __enter__(self, *args): 
+        # When entering the context (using `with`), set up hooks.
         self.hook_layers()
         return self
     
     def __exit__(self, *args): 
+        # When exiting the context, remove all hooks to avoid side effects.
         self.remove_hooks()
             
     def save_outputs_hook(self, layer_id):
@@ -73,10 +80,12 @@ class FeatureExtractor(nn.Module):
             if self.detach: output = detach(output)
             if self.clone: output = clone(output)
             if self.device: output = to_device(output, self.device)
+            # Store the final processed output.
             self._features[layer_id] = output
         return fn
 
     def forward(self, x):
+        # Standard forward pass of the model, with hooks capturing the features.
         _ = self.model(x)
         return self._features
     

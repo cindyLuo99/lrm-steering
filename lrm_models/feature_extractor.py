@@ -116,7 +116,9 @@ def get_layer_shapes(model, layer_names, x):
     with torch.no_grad():        
         with FeatureExtractor(model, layer_names) as extractor:
             features = extractor(x)
-            print(type(features))
-            print(features)
-            shapes = {k:v.shape for k,v in features.items()}
+            # v is a list, recording the passes
+            # so instead of v.shape:
+            # shapes = {k:v.shape for k,v in features.items()}
+            # maybe
+            shapes = {k: v[0].shape for k, v in features.items() if isinstance(v, list) and len(v) > 0}
     return shapes
